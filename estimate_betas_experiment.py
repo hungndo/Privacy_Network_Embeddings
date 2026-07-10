@@ -329,7 +329,7 @@ SBM_LR          = 3
 SBM_SCHEDULE_G  = 0.1
 SBM_SAMPLE_PCT  = 0.1
 SBM_BETA_STEPS  = 5
-SBM_C           = 0.3
+SBM_C           = 1 #0.3
 
 TARGET_DELTA = 1e-5
 
