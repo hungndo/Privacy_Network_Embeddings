@@ -1,41 +1,54 @@
 """
-DP-SBM comparison experiment driver (v5).
+DP-SBM comparison experiment on SPARSE synthetic graphs at fixed n = 500.
 
-Compares two privacy mechanisms for estimating block-pair edge
-probabilities (beta) on a 2-block SBM, at MATCHED actual epsilon per
-sweep point -- computed forward only, no root-finding:
+Same two methods, same accountant, same forward sigma->epsilon matching as
+script_no_known_node_label_synthetic_graph.py.  Differences:
 
-  1. sbm_dpsgd_all_noised drives the sweep: `sigma` is taken directly
-     from SIGMAS (forward: sigma -> epsilon, no search), with
-     sigma_gamma = 0.3*sigma and sigma_rho = 10*sigma preserving the
-     given ratios. Its resulting epsilon (via the tight RDP-style
-     composition, get_epsilon_combined) is computed directly from the
-     accountant -- one pass, no inversion.
+  * No N sweep: n is fixed at 500.  Instead we sweep two SPARSITY REGIMES,
+    both with an assortative 2-block structure and out/in ratio 0.1:
 
-  2. edge_flip_vem then REUSES that exact same computed epsilon as its
-     own `epsilon` argument for the same (N, sigma) grid point. This
-     works with no solving anywhere because edge_flip's epsilon
-     parameter IS its DP guarantee directly (any real value is valid),
-     so simply feeding it whatever epsilon the SBM method's forward
-     accountant produced is sufficient to put both methods on the same
-     actual privacy budget -- same trick as the original example script,
-     which computed epsilon once from sigma and reused it for both its
-     Gaussian and edge-flip methods.
+      1. "relatively_sparse":  p = log(n)/n,  q = 0.1 * p
+         -- the connectivity-threshold regime; expected degree ~ log n.
 
-Both methods write the SAME `epsilon` value per row (see FIELDNAMES) --
-that's the actual, shared privacy budget both used at that (N, sigma)
-point. sbm_dpsgd_all_noised additionally logs its three per-channel
-epsilons (epsilon_gamma/epsilon_beta/epsilon_rho) as diagnostics.
+      2. "sparse":             p = 5/n,       q = 0.1 * p
+         -- the constant-average-degree regime; expected degree stays O(1),
+            so a constant fraction of nodes sit in small components and
+            exact recovery is information-theoretically impossible.  Only
+            partial recovery (NMI < 1) is achievable even WITHOUT privacy
+            noise -- which is the point of including it: it separates the
+            NMI cost of privacy from the NMI cost of sparsity.
 
-CAVEAT: edge_flip_vem's VEM-SBM step uses N_VEM_RESTARTS restarts,
-selected by best ELBO, on the same A_flipped -- free w.r.t. privacy since
-every restart only re-processes the one already-released A_flipped, never
-raw A again (confirmed to raise single-run success from ~4/15 to 15/15
-in testing).
+  * The graph is resampled per rep (like the synthetic driver, unlike the
+    polblogs one), so rep variance covers both graph randomness and
+    DP-mechanism randomness.  Within a (regime, rep) the graph is the same
+    across all sigmas, so the sigma sweep is not confounded by resampling.
+
+  * CONNECTIVITY IS NOT ENFORCED.  Graphs are used exactly as drawn --
+    no rejection sampling, no largest-connected-component extraction.
+    At these densities whole graphs are essentially never connected (in
+    300 draws per regime: zero), because q = 0.1p pulls the mean degree
+    to 3.4 / 2.7, well under the log(n) ~ 6.2 connectivity threshold.
+    The LCC covers ~96% / ~92% of nodes, the remainder being almost
+    entirely isolated vertices.  This costs the methods nothing
+    structurally: both are likelihood-based over all N(N-1)/2 pairs
+    (non-edges included) and neither uses a spectral gap or random walks,
+    so an isolated node just gets posterior = prior rather than being
+    undefined.  Per-rep component diagnostics are written to the CSV
+    (lcc_size/lcc_frac/n_components/n_isolated) for the analysis
+    notebook; nothing in this script ever branches on them.
+
+  * Memory: this script carries the .detach() fix on the functorch
+    per-example gradients (see the comments at the two call sites).
+    Without it, each call leaks the outer autograd graph through a C++
+    reference cycle that gc.collect cannot break -- the leak that OOM'd
+    the polblogs runs.  Per-rep RSS is logged so a regression shows up
+    immediately rather than nine reps later.
 """
 
 import os
 import csv
+import time
+import resource
 import math
 import argparse
 
@@ -43,8 +56,24 @@ import numpy as np
 import networkx as nx
 import torch
 import torch.nn.functional as F
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from sklearn.metrics import normalized_mutual_info_score
 from torch.func import grad, vmap
 from torch.special import digamma, gammaln
+
+
+def _mem_report():
+    """Return (current_rss_gb, peak_rss_gb) -- cheap, just two file/syscall reads.
+
+    current RSS comes from /proc/self/statm (drops when memory is truly
+    freed, unlike ru_maxrss which is a monotonic high-water mark).
+    """
+    with open("/proc/self/statm") as fh:
+        rss_pages = int(fh.read().split()[1])
+    cur_rss_gb = rss_pages * resource.getpagesize() / (1024 ** 3)
+    peak_rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)
+    return cur_rss_gb, peak_rss_gb
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -74,14 +103,6 @@ def get_epsilon_combined(*log_moments_dicts, delta):
 
 def compute_eps_target_triple(N, sigma_beta, sigma_gamma, sigma_rho, sample_pct,
                                iter_, beta_steps, gamma_steps, target_delta):
-    """
-    Three-channel accountant matching binary_sbm_estimate_fully_variational's
-    actual loop: gamma gets iter_*gamma_steps noisy updates at sigma_gamma;
-    beta/alpha AND rho each get iter_*beta_steps noisy updates (both live
-    inside the same beta_step loop), at sigma_beta and sigma_rho respectively.
-    Returns (eps_gamma, eps_beta, eps_rho, eps_combined) where eps_combined
-    uses the tight joint (summed-log-moments-then-minimize) composition.
-    """
     total_pairs = N * (N - 1)
     n_samples = max(1, int(sample_pct * total_pairs))
     q = n_samples / total_pairs
@@ -119,8 +140,7 @@ def clip_per_example(grads_list, C, min_norm=1):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Method 1: edge-flip DP + VEM-SBM (labels + beta both derived from the
-# already-privatized A_flipped -- free by post-processing)
+# Method 1: edge-flip DP + VEM-SBM
 # ══════════════════════════════════════════════════════════════════════════
 
 def edge_flip(A, epsilon):
@@ -139,17 +159,6 @@ def edge_flip(A, epsilon):
 
 
 def binary_sbm_estimate_vem(A, num_blocks, iters=100, tol=1e-16, n_e_steps=1):
-    """
-    Plain (non-private) mean-field VEM for the binary SBM. Diagonal-biased
-    beta init, single run, no restarts -- see module docstring for the
-    known ~20-27% single-run success rate caveat.
-
-    Runs entirely on A's device (CPU or CUDA) -- all new tensors created
-    here are placed on A.device to avoid CPU/GPU tensor mismatches.
-
-    Returns (gamma, pi, beta, final_elbo) -- final_elbo lets callers do
-    restart-and-select without needing to recompute it externally.
-    """
     device = A.device
     n = A.shape[0]
     K = num_blocks
@@ -167,7 +176,9 @@ def binary_sbm_estimate_vem(A, num_blocks, iters=100, tol=1e-16, n_e_steps=1):
 
     prev_elbo = -float('inf')
     elbo = -float('inf')
+    n_iters_run = 0
     for it in range(iters):
+        n_iters_run += 1
         log_beta = torch.log(beta.clamp(eps, 1 - eps))
         log1m_beta = torch.log((1 - beta).clamp(eps, 1 - eps))
         for _ in range(n_e_steps):
@@ -197,44 +208,27 @@ def binary_sbm_estimate_vem(A, num_blocks, iters=100, tol=1e-16, n_e_steps=1):
             break
         prev_elbo = elbo
 
-    return gamma, pi, beta, elbo
+    epochs = n_iters_run * n_e_steps
+    return gamma, pi, beta, elbo, epochs
 
 
 def estimate_beta_dp_edgeflip_vem(A, num_blocks, epsilon, seed=0, vem_iters=100, n_restarts=1):
-    """
-    epsilon-relationship-DP beta estimate via symmetric edge-flip, with
-    labels ALSO estimated from the flipped matrix (VEM-SBM run on
-    A_flipped, never on raw A) -- see module docstring for why this
-    matters for privacy.
-
-    edge_flip itself is numpy-based (a nested Python loop, unrelated to
-    GPU) and always runs on CPU. VEM-SBM afterwards runs on WHATEVER
-    DEVICE `A` WAS ON -- if A lives on GPU, A_flipped is moved back to
-    that same device before VEM runs, so the VEM step still benefits
-    from GPU if one is available.
-
-    n_restarts: run VEM-SBM this many times (different random inits) on
-    the SAME A_flipped, keep the run with the best final ELBO. This is
-    FREE from a privacy-accounting standpoint -- every restart only
-    re-processes the one already-released A_flipped, never raw A again,
-    so this is post-processing regardless of how many restarts are used.
-
-    Returns (beta_hat (K,K) tensor, labels (N,) numpy array).
-    """
     is_torch = torch.is_tensor(A)
     original_device = A.device if is_torch else torch.device("cpu")
     A_np = A.detach().cpu().numpy() if is_torch else np.asarray(A)
 
-    A_flipped = edge_flip(A_np, epsilon)   # CPU-only, numpy
+    A_flipped = edge_flip(A_np, epsilon)
     A_flipped_t = torch.tensor(A_flipped, dtype=torch.float32, device=original_device)
 
     best_elbo = -float('inf')
     best_gamma = None
+    total_epochs = 0
     for trial in range(n_restarts):
         torch.manual_seed(seed * 1000 + trial)
         if original_device.type == "cuda":
             torch.cuda.manual_seed_all(seed * 1000 + trial)
-        gamma, _pi, _beta_vem, elbo = binary_sbm_estimate_vem(A_flipped_t, num_blocks, iters=vem_iters)
+        gamma, _pi, _beta_vem, elbo, epochs = binary_sbm_estimate_vem(A_flipped_t, num_blocks, iters=vem_iters)
+        total_epochs += epochs
         if elbo > best_elbo:
             best_elbo = elbo
             best_gamma = gamma
@@ -272,11 +266,11 @@ def estimate_beta_dp_edgeflip_vem(A, num_blocks, epsilon, seed=0, vem_iters=100,
             beta_hat[k, l] = corrected
             beta_hat[l, k] = corrected
 
-    return beta_hat, labels_np
+    return beta_hat, labels_np, total_epochs
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Method 2: fully-variational DP-SGD SBM, noise on gamma AND beta AND rho
+# Method 2: fully-variational DP-SGD SBM
 # ══════════════════════════════════════════════════════════════════════════
 
 def elbo_L1(A, gamma_logits, log_alpha1, log_alpha2, i_idx, j_idx, temperature):
@@ -369,6 +363,10 @@ def binary_sbm_estimate_fully_variational(
     schedule_privacy=0.1, schedule_privacy_gamma=0.1,
     verbose=False,
 ):
+    """
+    Returns (gamma_posterior, rho_posterior, beta_posterior_mean,
+             epochs_gamma, epochs_beta, epochs_total).
+    """
     N = A.shape[0]
     K = num_blocks
     device = A.device
@@ -415,6 +413,9 @@ def binary_sbm_estimate_fully_variational(
     log_moments_gamma = {lam: 0.0 for lam in range(1, 33)}
     log_moments_rho = {lam: 0.0 for lam in range(1, 33)}
 
+    total_L_gamma = 0
+    total_L_beta = 0
+
     def call_args(i_idx, j_idx, L, temperature):
         return (log_alpha1, log_alpha2, log_rho, gamma_logits, A, i_idx, j_idx, float(L), temperature)
 
@@ -441,8 +442,16 @@ def binary_sbm_estimate_fully_variational(
             idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
             i_idx, j_idx = idx[:, 0], idx[:, 1]
             L = len(i_idx)
+            total_L_gamma += L
 
             (g_gamma,) = per_example_grad_fn_gamma(*call_args(i_idx, j_idx, L, temperature))
+            # Detach: the model leaves have requires_grad=True, so functorch's
+            # grad output stays connected to the outer autograd graph. Left
+            # attached, assigning it (via gamma_logits.grad) forms a C++
+            # reference cycle that gc.collect can't break -- one whole graph
+            # leaks per rep, which is what OOM'd the polblogs runs. Detaching
+            # keeps identical values, drops the graph.
+            g_gamma = g_gamma.detach()
             clipped_sums, norms = clip_per_example([g_gamma], C_gamma, min_norm=1)
             gamma_grad = (clipped_sums[0] + torch.randn_like(clipped_sums[0]) * sigma_gamma * 2 * C_gamma) / L
             avg_grad_norm_gamma = norms.mean().item()
@@ -466,8 +475,11 @@ def binary_sbm_estimate_fully_variational(
             idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
             i_idx, j_idx = idx[:, 0], idx[:, 1]
             L = len(i_idx)
+            total_L_beta += L
 
             g_a1, g_a2, g_rho = per_example_grad_fn_beta(*call_args(i_idx, j_idx, L, 1.0))
+            # Same detach as in the gamma loop above -- see that comment.
+            g_a1, g_a2, g_rho = g_a1.detach(), g_a2.detach(), g_rho.detach()
 
             clipped_sums, norms = clip_per_example([g_a1, g_a2], C, min_norm=1)
             dp_grads = [
@@ -507,50 +519,43 @@ def binary_sbm_estimate_fully_variational(
     alpha2_posterior = F.softplus(log_alpha2).detach()
     beta_posterior_mean = alpha1_posterior / (alpha1_posterior + alpha2_posterior)
 
-    return gamma_posterior, rho_posterior, beta_posterior_mean
+    epochs_gamma = total_L_gamma / total_pairs
+    epochs_beta = total_L_beta / total_pairs
+    epochs_total = epochs_gamma + epochs_beta
+
+    return gamma_posterior, rho_posterior, beta_posterior_mean, epochs_gamma, epochs_beta, epochs_total
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # Hyperparameters
 # ══════════════════════════════════════════════════════════════════════════
 
-GRAPH_SIZES = [100, 200, 500, 1000]
-SIGMAS      = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]   # sbm_dpsgd_all_noised's sweep knob
+GRAPH_SIZE = 500              # fixed n for this experiment
+OUT_IN_RATIO = 0.1            # q = OUT_IN_RATIO * p in both regimes
+
+# The two sparsity regimes.  p is a callable of n so the setting stays
+# self-documenting (and stays correct if GRAPH_SIZE is ever changed).
+REGIMES = {
+    "relatively_sparse": lambda n: math.log(n) / n,   # expected degree ~ log n
+    "sparse":            lambda n: 5.0 / n,           # expected degree ~ O(1)
+}
+REGIME_ORDER = ["relatively_sparse", "sparse"]        # fixed order, for stable sharding
+
+# sigma=0.1 dropped: epsilon scales as 1/sigma^2, so it lands near ~2745,
+# and np.exp(epsilon) in edge_flip/p_flip overflows float64 (exp overflows
+# above ~709.8). It was also a scientifically empty grid point -- an epsilon
+# in the thousands is no privacy at all.
+SIGMAS      = [0.5, 1.0, 2.0, 5.0, 10.0]
 N_REPS      = 20
-N_VEM_RESTARTS = 10   # edge_flip_vem: VEM restarts on A_flipped, best-ELBO selected.
-                       # Free w.r.t. privacy cost -- see explanation in chat --
-                       # since every restart only re-processes the already-
-                       # released A_flipped, never raw A again.
+N_VEM_RESTARTS = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Both sbm_dpsgd_all_noised (the DP-SGD training loop, the expensive part)
-# and edge_flip_vem's VEM-SBM step run on DEVICE. edge_flip itself is a
-# numpy-based nested loop and always runs on CPU regardless (see
-# estimate_beta_dp_edgeflip_vem) -- moving that to GPU isn't meaningful,
-# it's not a tensor-math bottleneck.
 
-TRUE_P = 0.2
-TRUE_R = 0.02
 TARGET_DELTA = 1e-5
 NUM_BLOCKS = 2
 
-# sbm_dpsgd_all_noised: everything EXCEPT the three sigmas is fixed as given.
-# sigma is swept directly from SIGMAS (forward: sigma -> epsilon, same
-# direction as the original example script); sigma_gamma/sigma_rho are
-# derived to preserve the given ratios (sigma_gamma:sigma:sigma_rho =
-# 0.3:1:10). C/C_gamma/C_rho stay FIXED across the sweep, since the
-# accountant depends only on the sigmas, not on clip norms.
-#
-# The resulting eps_combined for that sigma is then reused DIRECTLY as
-# edge_flip_vem's epsilon argument for the same (N, sigma) grid point --
-# same trick as the original example script (which computed epsilon once
-# from the SBM method's sigma, then fed that same epsilon into both the
-# Gaussian and edge-flip methods). No solving/inversion needed anywhere:
-# edge_flip accepts any real-valued epsilon directly, so reusing whatever
-# epsilon the forward sigma->epsilon computation produces is sufficient
-# to get both methods onto the same actual privacy budget.
-SBM_SIGMA_GAMMA_RATIO = 0.3   # sigma_gamma = SBM_SIGMA_GAMMA_RATIO * sigma
-SBM_SIGMA_RHO_RATIO = 10.0    # sigma_rho   = SBM_SIGMA_RHO_RATIO   * sigma
+SBM_SIGMA_GAMMA_RATIO = 0.3
+SBM_SIGMA_RHO_RATIO = 10.0
 
 SBM_ALL_NOISED_HPARAMS = dict(
     iter=5, lr_gamma=3, lr_beta=0.3,
@@ -561,34 +566,80 @@ SBM_ALL_NOISED_HPARAMS = dict(
     schedule_privacy=0.001, schedule_privacy_gamma=0.1,
 )
 
-OUTPUT_CSV = "results_dp_sbm_comparison.csv"
+OUTPUT_CSV = "results_dp_sbm_sparse_n500.csv"
 
 FIELDNAMES = [
-    "N", "sigma", "epsilon", "rep", "method",   # `epsilon` is the ONE shared,
-                                                 # actual privacy budget both
-                                                 # methods used at this row
-    "epsilon_gamma", "epsilon_beta", "epsilon_rho",   # sbm_dpsgd_all_noised diagnostics only
+    "regime", "N", "p", "q",       # `regime` is the new sweep axis (replaces N)
+    "sigma", "epsilon", "rep", "method",
+    "epsilon_gamma", "epsilon_beta", "epsilon_rho",
+    "epochs", "epochs_gamma", "epochs_beta",
     "delta",
+    # ── graph diagnostics for THIS rep's graph (recorded, never acted on) ──
+    # The experiment deliberately runs on the FULL graph, disconnected or
+    # not -- these columns exist so the analysis notebook can show how
+    # fragmented the graphs were, not so any code can filter on them.
+    "mean_degree", "lcc_size", "lcc_frac", "n_components", "n_isolated",
     "beta_true_00", "beta_true_01", "beta_true_11",
     "beta_est_00", "beta_est_01", "beta_est_11",
+    "nmi",
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Experiment driver
+# Data generation
 # ══════════════════════════════════════════════════════════════════════════
 
-def make_graph(N, seed):
+def regime_params(regime, n=GRAPH_SIZE):
+    """(p, q) for a named regime at size n."""
+    p = REGIMES[regime](n)
+    return p, OUT_IN_RATIO * p
+
+
+def make_graph(N, p, q, seed):
+    """
+    Draw a planted-partition SBM graph.  NOTE: the graph is returned AS
+    DRAWN -- no connectivity check, no rejection sampling, no largest-
+    connected-component extraction.  At these densities whole graphs are
+    essentially never connected (mean degree 3.4 / 2.7, well under the
+    log(n) threshold), so requiring connectivity would either loop forever
+    or force a different sparsity regime.  Both methods here are
+    likelihood-based over all N(N-1)/2 pairs -- neither uses a spectral
+    gap or random walks -- so disconnection costs nothing structurally;
+    isolated nodes simply get posterior = prior.  See graph_stats() for
+    the diagnostics recorded about how fragmented each draw was.
+    """
     block_sizes = [N // 2, N - N // 2]
-    probs = np.array([[TRUE_P, TRUE_R], [TRUE_R, TRUE_P]])
+    probs = np.array([[p, q], [q, p]])
     G = nx.stochastic_block_model(block_sizes, probs, seed=seed)
     A = nx.to_numpy_array(G)
     labels = np.array([d['block'] for _, d in G.nodes(data=True)])
     return A, labels
 
 
+def graph_stats(A_np):
+    """
+    Connectivity diagnostics for one drawn graph, for logging only.
+
+    Returns (mean_degree, lcc_size, lcc_frac, n_components, n_isolated).
+    Nothing in the experiment branches on these -- every method always
+    sees the full graph.  They exist so the analysis notebook can show
+    how fragmented the graphs actually were.
+    """
+    n = A_np.shape[0]
+    degrees = A_np.sum(axis=1)
+    n_comp, comp_labels = connected_components(csr_matrix(A_np), directed=False)
+    lcc_size = int(np.bincount(comp_labels).max())
+    return (
+        float(A_np.sum() / n),        # mean degree
+        lcc_size,
+        lcc_size / n,
+        int(n_comp),
+        int((degrees == 0).sum()),
+    )
+
+
 def get_sharded_grid(shard_id, num_shards):
-    full_grid = [(N, sigma) for N in GRAPH_SIZES for sigma in SIGMAS]
+    full_grid = [(regime, sigma) for regime in REGIME_ORDER for sigma in SIGMAS]
     if num_shards <= 1:
         return full_grid
     return full_grid[shard_id::num_shards]
@@ -600,15 +651,23 @@ def write_row(writer, **kwargs):
     writer.writerow(row)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Experiment driver
+# ══════════════════════════════════════════════════════════════════════════
+
 def run(shard_id=0, num_shards=1):
     print(f"Using device: {DEVICE}", flush=True)
     if DEVICE.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}", flush=True)
     else:
-        print("  WARNING: CUDA not available -- running on CPU. If you requested "
-              "a GPU in your SLURM job, check that torch was installed with CUDA "
-              "support in this environment (torch.cuda.is_available() returned False).",
-              flush=True)
+        print("  WARNING: CUDA not available -- running on CPU.", flush=True)
+
+    N = GRAPH_SIZE
+    for regime in REGIME_ORDER:
+        p, q_edge = regime_params(regime, N)
+        exp_deg = (N // 2 - 1) * p + (N - N // 2) * q_edge
+        print(f"Regime '{regime}': p={p:.6f}  q={q_edge:.6f}  "
+              f"expected degree ~ {exp_deg:.2f}", flush=True)
 
     output_path = OUTPUT_CSV if num_shards <= 1 else f"{OUTPUT_CSV}.shard{shard_id}"
     write_header = not os.path.exists(output_path)
@@ -617,10 +676,11 @@ def run(shard_id=0, num_shards=1):
         if write_header:
             writer.writeheader()
 
-        true_00, true_01, true_11 = TRUE_P, TRUE_R, TRUE_P
-
         grid = get_sharded_grid(shard_id, num_shards)
-        for N, sigma in grid:
+        for regime, sigma in grid:
+            p, q_edge = regime_params(regime, N)
+            true_00, true_01, true_11 = p, q_edge, p
+
             sigma_gamma = SBM_SIGMA_GAMMA_RATIO * sigma
             sigma_rho = SBM_SIGMA_RHO_RATIO * sigma
 
@@ -633,49 +693,75 @@ def run(shard_id=0, num_shards=1):
                 gamma_steps=SBM_ALL_NOISED_HPARAMS["gamma_steps"],
                 target_delta=TARGET_DELTA,
             )
-            print(f"[N={N}, sigma={sigma}] -> epsilon={epsilon:.4f} "
+            print(f"[{regime}, sigma={sigma}] -> epsilon={epsilon:.4f} "
                   f"(eps_gamma={eps_gamma:.4f} eps_beta={eps_beta:.4f} eps_rho={eps_rho:.4f}); "
                   f"reused directly as edge_flip_vem's epsilon", flush=True)
 
             for rep in range(N_REPS):
-                seed = hash((N, rep)) % (2**31)   # same graph for both methods
-                A_np, _ = make_graph(N, seed)
+                rep_start = time.time()
+                # Same graph for both methods within a rep.  The seed depends
+                # only on (regime, rep), NOT on sigma, so a given rep sees the
+                # identical graph at every sigma -- the sigma sweep is not
+                # confounded by graph resampling.
+                seed = hash((regime, rep)) % (2**31)
+                A_np, true_labels = make_graph(N, p, q_edge, seed)
                 A_t = torch.tensor(A_np, dtype=torch.float32, device=DEVICE)
+                # Diagnostics only -- the full graph is used regardless.
+                mean_degree, lcc_size, lcc_frac, n_comp, n_iso = graph_stats(A_np)
+                gstats = dict(mean_degree=mean_degree, lcc_size=lcc_size,
+                              lcc_frac=lcc_frac, n_components=n_comp,
+                              n_isolated=n_iso)
 
                 # ── edge_flip_vem: reuses the SAME epsilon computed above ──
-                beta_ef, _labels_ef = estimate_beta_dp_edgeflip_vem(
+                np.random.seed(seed)
+                beta_ef, labels_ef, epochs_ef = estimate_beta_dp_edgeflip_vem(
                     A_t, num_blocks=NUM_BLOCKS, epsilon=epsilon, seed=seed, n_restarts=N_VEM_RESTARTS
                 )
+                nmi_ef = normalized_mutual_info_score(true_labels, labels_ef)
                 write_row(
-                    writer, N=N, sigma=sigma, epsilon=epsilon, rep=rep, method="edge_flip_vem",
-                    delta=TARGET_DELTA,
+                    writer, regime=regime, N=N, p=p, q=q_edge,
+                    sigma=sigma, epsilon=epsilon, rep=rep, method="edge_flip_vem",
+                    epochs=epochs_ef,
+                    delta=TARGET_DELTA, **gstats,
                     beta_true_00=true_00, beta_true_01=true_01, beta_true_11=true_11,
                     beta_est_00=beta_ef[0, 0].item(),
                     beta_est_01=beta_ef[0, 1].item(),
                     beta_est_11=beta_ef[1, 1].item(),
+                    nmi=nmi_ef,
                 )
 
                 # ── sbm_dpsgd_all_noised: the sigma that PRODUCED epsilon ──
                 torch.manual_seed(seed)
                 if DEVICE.type == "cuda":
                     torch.cuda.manual_seed_all(seed)
-                _gamma, _rho, beta_sbm = binary_sbm_estimate_fully_variational(
-                    A_t, NUM_BLOCKS, target_delta=TARGET_DELTA,
-                    sigma=sigma, sigma_gamma=sigma_gamma, sigma_rho=sigma_rho,
-                    **SBM_ALL_NOISED_HPARAMS,
-                )
+                gamma_sbm, _rho, beta_sbm, epochs_gamma_sbm, epochs_beta_sbm, epochs_total_sbm = \
+                    binary_sbm_estimate_fully_variational(
+                        A_t, NUM_BLOCKS, target_delta=TARGET_DELTA,
+                        sigma=sigma, sigma_gamma=sigma_gamma, sigma_rho=sigma_rho,
+                        **SBM_ALL_NOISED_HPARAMS,
+                    )
+                labels_sbm = gamma_sbm.argmax(dim=1).cpu().numpy()
+                nmi_sbm = normalized_mutual_info_score(true_labels, labels_sbm)
                 write_row(
-                    writer, N=N, sigma=sigma, epsilon=epsilon, rep=rep, method="sbm_dpsgd_all_noised",
+                    writer, regime=regime, N=N, p=p, q=q_edge,
+                    sigma=sigma, epsilon=epsilon, rep=rep, method="sbm_dpsgd_all_noised",
                     epsilon_gamma=eps_gamma, epsilon_beta=eps_beta, epsilon_rho=eps_rho,
-                    delta=TARGET_DELTA,
+                    epochs=epochs_total_sbm, epochs_gamma=epochs_gamma_sbm, epochs_beta=epochs_beta_sbm,
+                    delta=TARGET_DELTA, **gstats,
                     beta_true_00=true_00, beta_true_01=true_01, beta_true_11=true_11,
                     beta_est_00=beta_sbm[0, 0].item(),
                     beta_est_01=beta_sbm[0, 1].item(),
                     beta_est_11=beta_sbm[1, 1].item(),
+                    nmi=nmi_sbm,
                 )
 
                 f.flush()
-                print(f"  N={N} sigma={sigma} rep {rep + 1}/{N_REPS} done", flush=True)
+
+                cur_rss, peak_rss = _mem_report()
+                rep_secs = time.time() - rep_start
+                print(f"  {regime} sigma={sigma} rep {rep + 1}/{N_REPS} done in {rep_secs:.1f}s  "
+                      f"[LCC {lcc_size}/{N} = {lcc_frac:.1%}, {n_comp} comps, {n_iso} isolated] "
+                      f"[cur RSS: {cur_rss:.2f} GB | peak RSS: {peak_rss:.2f} GB]", flush=True)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ import argparse
 import numpy as np
 import networkx as nx
 import torch
+from sklearn.metrics import normalized_mutual_info_score
 import torch.nn.functional as F
 from torch.func import grad, vmap
 from torch.special import digamma, gammaln
@@ -144,26 +145,40 @@ def binary_sbm_estimate_vem(A, num_blocks, iters=100, tol=1e-16, n_e_steps=1):
     beta init, single run, no restarts -- see module docstring for the
     known ~20-27% single-run success rate caveat.
 
-    Returns (gamma, pi, beta, final_elbo) -- final_elbo lets callers do
-    restart-and-select without needing to recompute it externally.
+    Runs entirely on A's device (CPU or CUDA) -- all new tensors created
+    here are placed on A.device to avoid CPU/GPU tensor mismatches.
+
+    Returns (gamma, pi, beta, final_elbo, epochs) -- final_elbo lets
+    callers do restart-and-select without needing to recompute it
+    externally. epochs = actual_iterations_executed * n_e_steps: the
+    E-step is full-batch (touches the whole adjacency matrix every
+    iteration), and the tol=1e-16 early-stop can trigger well before
+    `iters` is reached (empirically as early as ~5-7 iterations for runs
+    that converge to a confident, near-one-hot solution quickly, and as
+    late as the full `iters` cap for runs that take longer to settle
+    into a degenerate fixed point -- see chat for the full analysis).
+    So epochs is NOT assumed to equal `iters`; it's counted directly.
     """
+    device = A.device
     n = A.shape[0]
     K = num_blocks
     eps = 1e-10
 
-    pi = torch.rand(K)
+    pi = torch.rand(K, device=device)
     pi = pi / pi.sum()
 
-    beta = torch.full((K, K), 0.2)
+    beta = torch.full((K, K), 0.2, device=device)
     beta.fill_diagonal_(0.8)
     beta = beta.clamp(eps, 1 - eps)
 
-    gamma = torch.rand(n, K)
+    gamma = torch.rand(n, K, device=device)
     gamma = gamma / gamma.sum(dim=1, keepdim=True)
 
     prev_elbo = -float('inf')
     elbo = -float('inf')
+    n_iters_run = 0
     for it in range(iters):
+        n_iters_run += 1
         log_beta = torch.log(beta.clamp(eps, 1 - eps))
         log1m_beta = torch.log((1 - beta).clamp(eps, 1 - eps))
         for _ in range(n_e_steps):
@@ -193,7 +208,8 @@ def binary_sbm_estimate_vem(A, num_blocks, iters=100, tol=1e-16, n_e_steps=1):
             break
         prev_elbo = elbo
 
-    return gamma, pi, beta, elbo
+    epochs = n_iters_run * n_e_steps
+    return gamma, pi, beta, elbo, epochs
 
 
 def estimate_beta_dp_edgeflip_vem(A, num_blocks, epsilon, seed=0, vem_iters=100, n_restarts=1):
@@ -203,29 +219,44 @@ def estimate_beta_dp_edgeflip_vem(A, num_blocks, epsilon, seed=0, vem_iters=100,
     A_flipped, never on raw A) -- see module docstring for why this
     matters for privacy.
 
+    edge_flip itself is numpy-based (a nested Python loop, unrelated to
+    GPU) and always runs on CPU. VEM-SBM afterwards runs on WHATEVER
+    DEVICE `A` WAS ON -- if A lives on GPU, A_flipped is moved back to
+    that same device before VEM runs, so the VEM step still benefits
+    from GPU if one is available.
+
     n_restarts: run VEM-SBM this many times (different random inits) on
     the SAME A_flipped, keep the run with the best final ELBO. This is
     FREE from a privacy-accounting standpoint -- every restart only
     re-processes the one already-released A_flipped, never raw A again,
     so this is post-processing regardless of how many restarts are used.
+    It is NOT free computationally, though -- every restart's epochs
+    count toward the total returned here.
 
-    Returns (beta_hat (K,K) tensor, labels (N,) numpy array).
+    Returns (beta_hat (K,K) tensor, labels (N,) numpy array, epochs)
+    -- epochs is the SUM of each restart's own epoch count (see
+    binary_sbm_estimate_vem's docstring for why that varies per restart).
     """
     is_torch = torch.is_tensor(A)
-    A_np = A.numpy() if is_torch else np.asarray(A)
+    original_device = A.device if is_torch else torch.device("cpu")
+    A_np = A.detach().cpu().numpy() if is_torch else np.asarray(A)
 
-    A_flipped = edge_flip(A_np, epsilon)
-    A_flipped_t = torch.tensor(A_flipped, dtype=torch.float32)
+    A_flipped = edge_flip(A_np, epsilon)   # CPU-only, numpy
+    A_flipped_t = torch.tensor(A_flipped, dtype=torch.float32, device=original_device)
 
     best_elbo = -float('inf')
     best_gamma = None
+    total_epochs = 0
     for trial in range(n_restarts):
         torch.manual_seed(seed * 1000 + trial)
-        gamma, _pi, _beta_vem, elbo = binary_sbm_estimate_vem(A_flipped_t, num_blocks, iters=vem_iters)
+        if original_device.type == "cuda":
+            torch.cuda.manual_seed_all(seed * 1000 + trial)
+        gamma, _pi, _beta_vem, elbo, epochs = binary_sbm_estimate_vem(A_flipped_t, num_blocks, iters=vem_iters)
+        total_epochs += epochs
         if elbo > best_elbo:
             best_elbo = elbo
             best_gamma = gamma
-    labels_np = best_gamma.argmax(dim=1).numpy()
+    labels_np = best_gamma.argmax(dim=1).cpu().numpy()
 
     K = num_blocks
     p_flip = 1 / (1 + np.exp(epsilon))
@@ -259,7 +290,7 @@ def estimate_beta_dp_edgeflip_vem(A, num_blocks, epsilon, seed=0, vem_iters=100,
             beta_hat[k, l] = corrected
             beta_hat[l, k] = corrected
 
-    return beta_hat, labels_np
+    return beta_hat, labels_np, total_epochs
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -281,6 +312,7 @@ def elbo_L1(A, gamma_logits, log_alpha1, log_alpha2, i_idx, j_idx, temperature):
 
 def elbo_rest(gamma_logits, log_alpha1, log_alpha2, log_rho, temperature):
     N, K = gamma_logits.shape
+    device = gamma_logits.device
     gamma = F.softmax(gamma_logits / temperature, dim=-1)
     alpha1 = F.softplus(log_alpha1)
     alpha2 = F.softplus(log_alpha2)
@@ -293,9 +325,9 @@ def elbo_rest(gamma_logits, log_alpha1, log_alpha2, log_rho, temperature):
 
     L2 = (gamma * E_log_pi.unsqueeze(0)).sum()
 
-    prior_alpha1 = torch.ones(K, K)
-    prior_alpha2 = torch.ones(K, K)
-    diag = torch.eye(K, dtype=torch.bool)
+    prior_alpha1 = torch.ones(K, K, device=device)
+    prior_alpha2 = torch.ones(K, K, device=device)
+    diag = torch.eye(K, dtype=torch.bool, device=device)
     prior_alpha1[diag] = 3.0
     prior_alpha2[diag] = 1.0
     prior_alpha1[~diag] = 1.0
@@ -321,7 +353,7 @@ def elbo_sampled(A, gamma_logits, log_alpha1, log_alpha2, log_rho, sample_pct=0.
     N = gamma_logits.shape[0]
     total_pairs = N * (N - 1)
     n_samples = max(1, int(sample_pct * total_pairs))
-    idx = torch.randint(0, N, (n_samples * 2, 2))
+    idx = torch.randint(0, N, (n_samples * 2, 2), device=gamma_logits.device)
     idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
     i_idx, j_idx = idx[:, 0], idx[:, 1]
     L1 = elbo_L1(A, gamma_logits, log_alpha1, log_alpha2, i_idx, j_idx, temperature)
@@ -355,8 +387,25 @@ def binary_sbm_estimate_fully_variational(
     schedule_privacy=0.1, schedule_privacy_gamma=0.1,
     verbose=False,
 ):
+    """
+    Returns (gamma_posterior, rho_posterior, beta_posterior_mean,
+             epochs_gamma, epochs_beta, epochs_total).
+
+    epochs_gamma/epochs_beta are computed from the ACTUAL realized batch
+    size L at every step (summed across all outer iters * inner steps,
+    divided by total_pairs) -- not the theoretical n_samples, since L can
+    be slightly smaller after the i!=j dedup filter. epochs_beta covers
+    BOTH alpha (log_alpha1/log_alpha2) and rho, since they share the same
+    sampled batch within each beta_step. epochs_total is their sum.
+
+    Under the current fixed hyperparameters this works out to a constant
+    (sample_pct * iter * (gamma_steps + beta_steps)) independent of N or
+    sigma -- confirmed analytically since none of those four quantities
+    vary across the sweep.
+    """
     N = A.shape[0]
     K = num_blocks
+    device = A.device
     sigma_gamma = sigma if sigma_gamma is None else sigma_gamma
     C_gamma = C if C_gamma is None else C_gamma
     sigma_rho = sigma if sigma_rho is None else sigma_rho
@@ -366,16 +415,16 @@ def binary_sbm_estimate_fully_variational(
     C_gamma_init = C_gamma
     C_rho_init = C_rho
 
-    gamma_logits = torch.randn(N, K).requires_grad_(True)
+    gamma_logits = torch.randn(N, K, device=device).requires_grad_(True)
 
-    log_alpha1_init = torch.full((K, K), 3.0)
-    log_alpha2_init = torch.full((K, K), 10.0)
-    diag = torch.eye(K, dtype=torch.bool)
+    log_alpha1_init = torch.full((K, K), 3.0, device=device)
+    log_alpha2_init = torch.full((K, K), 10.0, device=device)
+    diag = torch.eye(K, dtype=torch.bool, device=device)
     log_alpha1_init[diag] = 10.0
     log_alpha2_init[diag] = 3.0
     log_alpha1 = log_alpha1_init.clone().requires_grad_(True)
     log_alpha2 = log_alpha2_init.clone().requires_grad_(True)
-    log_rho = (torch.randn(K) + 3.0).requires_grad_(True)
+    log_rho = (torch.randn(K, device=device) + 3.0).requires_grad_(True)
 
     dp_params_beta = [log_alpha1, log_alpha2, log_rho]
 
@@ -400,6 +449,13 @@ def binary_sbm_estimate_fully_variational(
     log_moments_gamma = {lam: 0.0 for lam in range(1, 33)}
     log_moments_rho = {lam: 0.0 for lam in range(1, 33)}
 
+    # epoch tracking: sum the ACTUAL realized batch size L at each step
+    # (not the theoretical n_samples -- L can be slightly smaller after
+    # the i!=j dedup filter, especially at small N), then convert to
+    # epoch-equivalents by dividing by total_pairs at the end.
+    total_L_gamma = 0
+    total_L_beta = 0
+
     def call_args(i_idx, j_idx, L, temperature):
         return (log_alpha1, log_alpha2, log_rho, gamma_logits, A, i_idx, j_idx, float(L), temperature)
 
@@ -422,10 +478,11 @@ def binary_sbm_estimate_fully_variational(
             f_inner_gamma = temperature / T_end
             C_gamma = C_gamma_outer / f_inner_gamma
 
-            idx = torch.randint(0, N, (n_samples * 2, 2))
+            idx = torch.randint(0, N, (n_samples * 2, 2), device=device)
             idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
             i_idx, j_idx = idx[:, 0], idx[:, 1]
             L = len(i_idx)
+            total_L_gamma += L
 
             (g_gamma,) = per_example_grad_fn_gamma(*call_args(i_idx, j_idx, L, temperature))
             clipped_sums, norms = clip_per_example([g_gamma], C_gamma, min_norm=1)
@@ -447,10 +504,11 @@ def binary_sbm_estimate_fully_variational(
             C = C_outer / f_inner_beta
             C_rho = C_rho_outer / f_inner_beta
 
-            idx = torch.randint(0, N, (n_samples * 2, 2))
+            idx = torch.randint(0, N, (n_samples * 2, 2), device=device)
             idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
             i_idx, j_idx = idx[:, 0], idx[:, 1]
             L = len(i_idx)
+            total_L_beta += L
 
             g_a1, g_a2, g_rho = per_example_grad_fn_beta(*call_args(i_idx, j_idx, L, 1.0))
 
@@ -492,20 +550,31 @@ def binary_sbm_estimate_fully_variational(
     alpha2_posterior = F.softplus(log_alpha2).detach()
     beta_posterior_mean = alpha1_posterior / (alpha1_posterior + alpha2_posterior)
 
-    return gamma_posterior, rho_posterior, beta_posterior_mean
+    epochs_gamma = total_L_gamma / total_pairs
+    epochs_beta = total_L_beta / total_pairs
+    epochs_total = epochs_gamma + epochs_beta
+
+    return gamma_posterior, rho_posterior, beta_posterior_mean, epochs_gamma, epochs_beta, epochs_total
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # Hyperparameters
 # ══════════════════════════════════════════════════════════════════════════
 
-GRAPH_SIZES = [100, 200, 500, 1000]
-SIGMAS      = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]   # sbm_dpsgd_all_noised's sweep knob
+GRAPH_SIZES = [100, 200, 500]
+SIGMAS      = [0.1,0.5, 1.0, 2.0, 5.0, 10.0]   # sbm_dpsgd_all_noised's sweep knob
 N_REPS      = 20
 N_VEM_RESTARTS = 10   # edge_flip_vem: VEM restarts on A_flipped, best-ELBO selected.
                        # Free w.r.t. privacy cost -- see explanation in chat --
                        # since every restart only re-processes the already-
                        # released A_flipped, never raw A again.
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Both sbm_dpsgd_all_noised (the DP-SGD training loop, the expensive part)
+# and edge_flip_vem's VEM-SBM step run on DEVICE. edge_flip itself is a
+# numpy-based nested loop and always runs on CPU regardless (see
+# estimate_beta_dp_edgeflip_vem) -- moving that to GPU isn't meaningful,
+# it's not a tensor-math bottleneck.
 
 TRUE_P = 0.2
 TRUE_R = 0.02
@@ -539,16 +608,24 @@ SBM_ALL_NOISED_HPARAMS = dict(
     schedule_privacy=0.001, schedule_privacy_gamma=0.1,
 )
 
-OUTPUT_CSV = "results_dp_sbm_comparison.csv"
+OUTPUT_CSV = "results_dp_sbm_comparison_with_epochs.csv"
 
 FIELDNAMES = [
     "N", "sigma", "epsilon", "rep", "method",   # `epsilon` is the ONE shared,
                                                  # actual privacy budget both
                                                  # methods used at this row
     "epsilon_gamma", "epsilon_beta", "epsilon_rho",   # sbm_dpsgd_all_noised diagnostics only
+    "epochs",                                         # shared: total compute cost, in units of
+                                                       # one full pass over all pairs (see chat --
+                                                       # NOT directly wall-clock comparable across
+                                                       # methods, since a VEM epoch is a dense O(N^2)
+                                                       # matmul pass and an SBM-DPSGD epoch is a
+                                                       # sampled per-example-autodiff pass)
+    "epochs_gamma", "epochs_beta",                    # sbm_dpsgd_all_noised diagnostics only
     "delta",
     "beta_true_00", "beta_true_01", "beta_true_11",
     "beta_est_00", "beta_est_01", "beta_est_11",
+    "nmi",
 ]
 
 
@@ -579,6 +656,15 @@ def write_row(writer, **kwargs):
 
 
 def run(shard_id=0, num_shards=1):
+    print(f"Using device: {DEVICE}", flush=True)
+    if DEVICE.type == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    else:
+        print("  WARNING: CUDA not available -- running on CPU. If you requested "
+              "a GPU in your SLURM job, check that torch was installed with CUDA "
+              "support in this environment (torch.cuda.is_available() returned False).",
+              flush=True)
+
     output_path = OUTPUT_CSV if num_shards <= 1 else f"{OUTPUT_CSV}.shard{shard_id}"
     write_header = not os.path.exists(output_path)
     with open(output_path, "a", newline="") as f:
@@ -608,37 +694,46 @@ def run(shard_id=0, num_shards=1):
 
             for rep in range(N_REPS):
                 seed = hash((N, rep)) % (2**31)   # same graph for both methods
-                A_np, _ = make_graph(N, seed)
-                A_t = torch.tensor(A_np, dtype=torch.float32)
+                A_np, true_labels = make_graph(N, seed)
+                A_t = torch.tensor(A_np, dtype=torch.float32, device=DEVICE)
 
                 # ── edge_flip_vem: reuses the SAME epsilon computed above ──
-                beta_ef, _labels_ef = estimate_beta_dp_edgeflip_vem(
+                beta_ef, labels_ef, epochs_ef = estimate_beta_dp_edgeflip_vem(
                     A_t, num_blocks=NUM_BLOCKS, epsilon=epsilon, seed=seed, n_restarts=N_VEM_RESTARTS
                 )
+                nmi_ef = normalized_mutual_info_score(true_labels, labels_ef)
                 write_row(
                     writer, N=N, sigma=sigma, epsilon=epsilon, rep=rep, method="edge_flip_vem",
+                    epochs=epochs_ef,
                     delta=TARGET_DELTA,
                     beta_true_00=true_00, beta_true_01=true_01, beta_true_11=true_11,
                     beta_est_00=beta_ef[0, 0].item(),
                     beta_est_01=beta_ef[0, 1].item(),
                     beta_est_11=beta_ef[1, 1].item(),
+                    nmi=nmi_ef,
                 )
 
                 # ── sbm_dpsgd_all_noised: the sigma that PRODUCED epsilon ──
                 torch.manual_seed(seed)
-                _gamma, _rho, beta_sbm = binary_sbm_estimate_fully_variational(
+                if DEVICE.type == "cuda":
+                    torch.cuda.manual_seed_all(seed)
+                gamma_sbm, _rho, beta_sbm, epochs_gamma_sbm, epochs_beta_sbm, epochs_total_sbm = binary_sbm_estimate_fully_variational(
                     A_t, NUM_BLOCKS, target_delta=TARGET_DELTA,
                     sigma=sigma, sigma_gamma=sigma_gamma, sigma_rho=sigma_rho,
                     **SBM_ALL_NOISED_HPARAMS,
                 )
+                labels_sbm = gamma_sbm.argmax(dim=1).cpu().numpy()
+                nmi_sbm = normalized_mutual_info_score(true_labels, labels_sbm)
                 write_row(
                     writer, N=N, sigma=sigma, epsilon=epsilon, rep=rep, method="sbm_dpsgd_all_noised",
                     epsilon_gamma=eps_gamma, epsilon_beta=eps_beta, epsilon_rho=eps_rho,
+                    epochs=epochs_total_sbm, epochs_gamma=epochs_gamma_sbm, epochs_beta=epochs_beta_sbm,
                     delta=TARGET_DELTA,
                     beta_true_00=true_00, beta_true_01=true_01, beta_true_11=true_11,
                     beta_est_00=beta_sbm[0, 0].item(),
                     beta_est_01=beta_sbm[0, 1].item(),
                     beta_est_11=beta_sbm[1, 1].item(),
+                    nmi=nmi_sbm,
                 )
 
                 f.flush()

@@ -334,7 +334,7 @@ SBM_C           = 1 #0.3
 TARGET_DELTA = 1e-5
 
 # ── Sweep grids ──────────────────────────────────────────────────────────
-GRAPH_SIZES = [100, 200, 500, 1000, 2000]   # total nodes, split into 2 equal blocks
+GRAPH_SIZES = [100, 200, 500]   # total nodes, split into 2 equal blocks
 SIGMAS      = [1.0, 2.0, 5.0, 10.0, 20.0]    # determines epsilon per N via accountant
 N_REPS      = 20
 
