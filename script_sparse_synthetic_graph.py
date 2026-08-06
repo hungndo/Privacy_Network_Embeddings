@@ -1,8 +1,9 @@
 """
 DP-SBM comparison experiment on SPARSE synthetic graphs at fixed n = 500.
 
-Same two methods, same accountant, same forward sigma->epsilon matching as
-script_no_known_node_label_synthetic_graph.py.  Differences:
+Same two DP methods, same accountant, same forward sigma->epsilon matching
+as script_no_known_node_label_synthetic_graph.py, plus a non-private
+spectral-clustering baseline.  Differences:
 
   * No N sweep: n is fixed at 500.  Instead we sweep two SPARSITY REGIMES,
     both with an assortative 2-block structure and out/in ratio 0.1:
@@ -23,19 +24,30 @@ script_no_known_node_label_synthetic_graph.py.  Differences:
     DP-mechanism randomness.  Within a (regime, rep) the graph is the same
     across all sigmas, so the sigma sweep is not confounded by resampling.
 
-  * CONNECTIVITY IS NOT ENFORCED.  Graphs are used exactly as drawn --
-    no rejection sampling, no largest-connected-component extraction.
-    At these densities whole graphs are essentially never connected (in
-    300 draws per regime: zero), because q = 0.1p pulls the mean degree
-    to 3.4 / 2.7, well under the log(n) ~ 6.2 connectivity threshold.
-    The LCC covers ~96% / ~92% of nodes, the remainder being almost
-    entirely isolated vertices.  This costs the methods nothing
-    structurally: both are likelihood-based over all N(N-1)/2 pairs
-    (non-edges included) and neither uses a spectral gap or random walks,
-    so an isolated node just gets posterior = prior rather than being
-    undefined.  Per-rep component diagnostics are written to the CSV
-    (lcc_size/lcc_frac/n_components/n_isolated) for the analysis
-    notebook; nothing in this script ever branches on them.
+  * EVERY METHOD IS FIT ON THE LARGEST CONNECTED COMPONENT ONLY.  The
+    graph is drawn without any rejection sampling -- at these densities
+    whole graphs are essentially never connected (in 300 draws per
+    regime: zero), because q = 0.1p pulls the mean degree to 3.4 / 2.7,
+    well under the log(n) ~ 6.2 connectivity threshold -- and the LCC is
+    then extracted and used as the data.  The LCC covers ~96% / ~92% of
+    nodes, the remainder being almost entirely isolated vertices, which
+    carry no signal for any method (the likelihood-based methods give
+    them posterior = prior; spectral clustering is undefined on a
+    disconnected affinity matrix).  Restricting to the LCC is what makes
+    the spectral baseline well posed and keeps all three methods scored
+    on exactly the same node set.  Per-rep diagnostics of the FULL drawn
+    graph (mean_degree/lcc_size/lcc_frac/n_components/n_isolated) are
+    still written to the CSV, alongside n_fit = the number of nodes
+    actually fit (= lcc_size).
+
+  * A NON-PRIVATE BASELINE: sklearn's SpectralClustering, fit directly
+    on the true (unperturbed) LCC adjacency with affinity="precomputed".
+    It sees no DP noise at all, so its NMI is the ceiling the two DP
+    methods are measured against.  Its row is written once per
+    (regime, sigma, rep) with epsilon = inf; because the graph within a
+    rep does not depend on sigma, the baseline is constant along the
+    sigma axis by construction -- it is repeated per sigma purely so the
+    analysis notebook can plot it against each sigma without a join.
 
   * Memory: this script carries the .detach() fix on the functorch
     per-example gradients (see the comments at the two call sites).
@@ -58,6 +70,7 @@ import torch
 import torch.nn.functional as F
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
+from sklearn.cluster import SpectralClustering
 from sklearn.metrics import normalized_mutual_info_score
 from torch.func import grad, vmap
 from torch.special import digamma, gammaln
@@ -527,6 +540,56 @@ def binary_sbm_estimate_fully_variational(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Baseline: non-private spectral clustering (sklearn)
+# ══════════════════════════════════════════════════════════════════════════
+
+def empirical_beta(A_np, labels, K):
+    """
+    Plug-in block-connection probabilities from an UNPERTURBED adjacency
+    and a label vector.  Same estimator the edge-flip method uses, minus
+    the flip de-biasing (there is nothing to de-bias here).
+    Returns a (K, K) numpy array.
+    """
+    beta = np.zeros((K, K))
+    for k in range(K):
+        mask_k = labels == k
+        n_k = mask_k.sum()
+        for l in range(k, K):
+            mask_l = labels == l
+            n_l = mask_l.sum()
+            if k == l:
+                edge_count = A_np[np.ix_(mask_k, mask_k)].sum() / 2.0
+                total_pairs = n_k * (n_k - 1) / 2.0
+            else:
+                edge_count = A_np[np.ix_(mask_k, mask_l)].sum()
+                total_pairs = n_k * n_l
+            val = edge_count / total_pairs if total_pairs > 0 else 0.0
+            beta[k, l] = beta[l, k] = val
+    return beta
+
+
+def estimate_spectral_baseline(A_np, num_blocks, seed=0):
+    """
+    Fit sklearn SpectralClustering DIRECTLY on the true adjacency -- no
+    edge flipping, no gradient noise, no privacy of any kind.  This is
+    the non-private ceiling the two DP methods are compared against.
+
+    A_np must be the LCC adjacency: SpectralClustering with a precomputed
+    affinity assumes a connected graph, and on a disconnected one the
+    eigenvectors it recovers just indicate components rather than blocks.
+
+    Returns (beta_hat, labels).
+    """
+    spectral = SpectralClustering(
+        n_clusters=num_blocks,
+        affinity="precomputed",
+        random_state=seed,
+    )
+    labels = spectral.fit_predict(A_np)
+    return empirical_beta(A_np, labels, num_blocks), labels
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Hyperparameters
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -574,10 +637,11 @@ FIELDNAMES = [
     "epsilon_gamma", "epsilon_beta", "epsilon_rho",
     "epochs", "epochs_gamma", "epochs_beta",
     "delta",
-    # ── graph diagnostics for THIS rep's graph (recorded, never acted on) ──
-    # The experiment deliberately runs on the FULL graph, disconnected or
-    # not -- these columns exist so the analysis notebook can show how
-    # fragmented the graphs were, not so any code can filter on them.
+    # ── diagnostics of THIS rep's FULL drawn graph, before LCC extraction ──
+    # All methods are fit on the LCC, so n_fit (= lcc_size) is the node
+    # count that was actually modelled; N stays the nominal draw size and
+    # the rest describe how fragmented the draw was.
+    "n_fit",
     "mean_degree", "lcc_size", "lcc_frac", "n_components", "n_isolated",
     "beta_true_00", "beta_true_01", "beta_true_11",
     "beta_est_00", "beta_est_01", "beta_est_11",
@@ -597,16 +661,14 @@ def regime_params(regime, n=GRAPH_SIZE):
 
 def make_graph(N, p, q, seed):
     """
-    Draw a planted-partition SBM graph.  NOTE: the graph is returned AS
-    DRAWN -- no connectivity check, no rejection sampling, no largest-
-    connected-component extraction.  At these densities whole graphs are
-    essentially never connected (mean degree 3.4 / 2.7, well under the
-    log(n) threshold), so requiring connectivity would either loop forever
-    or force a different sparsity regime.  Both methods here are
-    likelihood-based over all N(N-1)/2 pairs -- neither uses a spectral
-    gap or random walks -- so disconnection costs nothing structurally;
-    isolated nodes simply get posterior = prior.  See graph_stats() for
-    the diagnostics recorded about how fragmented each draw was.
+    Draw a planted-partition SBM graph.  The graph is returned AS DRAWN --
+    no connectivity check and no rejection sampling.  At these densities
+    whole graphs are essentially never connected (mean degree 3.4 / 2.7,
+    well under the log(n) threshold), so requiring connectivity would
+    either loop forever or force a different sparsity regime.  Instead the
+    caller passes the draw through extract_lcc() and fits every method on
+    the largest connected component; see graph_stats() for the
+    diagnostics recorded about how fragmented each draw was.
     """
     block_sizes = [N // 2, N - N // 2]
     probs = np.array([[p, q], [q, p]])
@@ -616,14 +678,31 @@ def make_graph(N, p, q, seed):
     return A, labels
 
 
+def extract_lcc(A_np, labels):
+    """
+    Restrict a drawn graph to its largest connected component.
+
+    Returns (A_lcc, labels_lcc) with nodes in their original relative
+    order.  Every method in this script is fit on this subgraph: it is
+    what makes the spectral baseline well posed (a precomputed affinity
+    over a disconnected graph yields component indicators, not blocks)
+    and it keeps all three methods scored on the identical node set.
+    """
+    _n_comp, comp_labels = connected_components(csr_matrix(A_np), directed=False)
+    lcc_id = np.bincount(comp_labels).argmax()
+    keep = np.flatnonzero(comp_labels == lcc_id)
+    return A_np[np.ix_(keep, keep)], labels[keep]
+
+
 def graph_stats(A_np):
     """
-    Connectivity diagnostics for one drawn graph, for logging only.
+    Connectivity diagnostics for one FULL drawn graph, before the LCC is
+    extracted -- for logging only.
 
     Returns (mean_degree, lcc_size, lcc_frac, n_components, n_isolated).
-    Nothing in the experiment branches on these -- every method always
-    sees the full graph.  They exist so the analysis notebook can show
-    how fragmented the graphs actually were.
+    Nothing branches on these; they exist so the analysis notebook can
+    show how fragmented the draws were and hence how much of the graph
+    the fit actually covered.
     """
     n = A_np.shape[0]
     degrees = A_np.sum(axis=1)
@@ -684,7 +763,12 @@ def run(shard_id=0, num_shards=1):
             sigma_gamma = SBM_SIGMA_GAMMA_RATIO * sigma
             sigma_rho = SBM_SIGMA_RHO_RATIO * sigma
 
-            # forward: sigma -> epsilon (cheap, no search)
+            # forward: sigma -> epsilon (cheap, no search).  Computed once at
+            # the nominal N even though the fits run on the (smaller) LCC:
+            # the accountant only sees N through q = int(sample_pct * N(N-1))
+            # / (N(N-1)) = sample_pct up to flooring, so the LCC size moves
+            # epsilon by <1e-6 while a per-rep epsilon would make the column
+            # unusable as a grouping key in the analysis notebook.
             eps_gamma, eps_beta, eps_rho, epsilon = compute_eps_target_triple(
                 N, sigma_beta=sigma, sigma_gamma=sigma_gamma, sigma_rho=sigma_rho,
                 sample_pct=SBM_ALL_NOISED_HPARAMS["sample_pct"],
@@ -704,13 +788,36 @@ def run(shard_id=0, num_shards=1):
                 # identical graph at every sigma -- the sigma sweep is not
                 # confounded by graph resampling.
                 seed = hash((regime, rep)) % (2**31)
-                A_np, true_labels = make_graph(N, p, q_edge, seed)
+                A_full, labels_full = make_graph(N, p, q_edge, seed)
+                # Diagnostics describe the FULL draw...
+                mean_degree, lcc_size, lcc_frac, n_comp, n_iso = graph_stats(A_full)
+                # ...but every method below is fit, and every metric below is
+                # scored, on the largest connected component alone.
+                A_np, true_labels = extract_lcc(A_full, labels_full)
+                n_fit = A_np.shape[0]
                 A_t = torch.tensor(A_np, dtype=torch.float32, device=DEVICE)
-                # Diagnostics only -- the full graph is used regardless.
-                mean_degree, lcc_size, lcc_frac, n_comp, n_iso = graph_stats(A_np)
-                gstats = dict(mean_degree=mean_degree, lcc_size=lcc_size,
-                              lcc_frac=lcc_frac, n_components=n_comp,
-                              n_isolated=n_iso)
+                gstats = dict(n_fit=n_fit, mean_degree=mean_degree,
+                              lcc_size=lcc_size, lcc_frac=lcc_frac,
+                              n_components=n_comp, n_isolated=n_iso)
+
+                # ── spectral (sklearn), NO privacy: the baseline ceiling ──
+                # Fit on the true LCC adjacency; epsilon = inf marks that it
+                # spends no privacy budget.  Identical across sigma within a
+                # rep by construction (same graph, same seed).
+                beta_sc, labels_sc = estimate_spectral_baseline(
+                    A_np, num_blocks=NUM_BLOCKS, seed=seed
+                )
+                nmi_sc = normalized_mutual_info_score(true_labels, labels_sc)
+                write_row(
+                    writer, regime=regime, N=N, p=p, q=q_edge,
+                    sigma=sigma, epsilon=float("inf"), rep=rep, method="spectral",
+                    delta=TARGET_DELTA, **gstats,
+                    beta_true_00=true_00, beta_true_01=true_01, beta_true_11=true_11,
+                    beta_est_00=beta_sc[0, 0],
+                    beta_est_01=beta_sc[0, 1],
+                    beta_est_11=beta_sc[1, 1],
+                    nmi=nmi_sc,
+                )
 
                 # ── edge_flip_vem: reuses the SAME epsilon computed above ──
                 np.random.seed(seed)
@@ -760,7 +867,8 @@ def run(shard_id=0, num_shards=1):
                 cur_rss, peak_rss = _mem_report()
                 rep_secs = time.time() - rep_start
                 print(f"  {regime} sigma={sigma} rep {rep + 1}/{N_REPS} done in {rep_secs:.1f}s  "
-                      f"[LCC {lcc_size}/{N} = {lcc_frac:.1%}, {n_comp} comps, {n_iso} isolated] "
+                      f"[fit on LCC {lcc_size}/{N} = {lcc_frac:.1%}, {n_comp} comps, {n_iso} isolated] "
+                      f"[NMI spectral={nmi_sc:.3f} edge_flip={nmi_ef:.3f} dpsgd={nmi_sbm:.3f}] "
                       f"[cur RSS: {cur_rss:.2f} GB | peak RSS: {peak_rss:.2f} GB]", flush=True)
 
 
