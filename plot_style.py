@@ -175,6 +175,28 @@ def apply_style():
 # The grouped boxplot every notebook draws
 # ══════════════════════════════════════════════════════════════════════════
 
+def box_positions(methods, x_values, box_frac=0.8):
+    """
+    x positions of each (x value, method) box, and the per-box slot width.
+
+    Single source of truth for the side-by-side layout: `grouped_boxplot` draws
+    at these positions, and callers that need to annotate ON TOP of a specific
+    box (e.g. marking a group whose values are all identical, which draws as a
+    zero-height box) ask for the same numbers instead of re-deriving them.
+
+    Returns ``(positions, width)`` where ``positions[(xv, method)]`` is the box
+    centre and ``width`` is the slot width one box is allotted.
+    """
+    methods = order_methods(methods)
+    width = box_frac / max(len(methods), 1)
+    positions = {
+        (xv, method): x_idx + (m_idx - len(methods) / 2 + 0.5) * width
+        for x_idx, xv in enumerate(x_values)
+        for m_idx, method in enumerate(methods)
+    }
+    return positions, width
+
+
 def grouped_boxplot(ax, data, value_col, x_col="epsilon", method_col="method",
                     methods=None, x_values=None, box_frac=0.8,
                     x_fmt="{:.2g}", rotation=45, showfliers=True):
@@ -191,17 +213,17 @@ def grouped_boxplot(ax, data, value_col, x_col="epsilon", method_col="method",
                             else data[method_col].unique())
     if x_values is None:
         x_values = sorted(data[x_col].unique())
-    width = box_frac / max(len(methods), 1)
+    pos_map, width = box_positions(methods, x_values, box_frac=box_frac)
 
     boxes, positions, colors = [], [], []
-    for x_idx, xv in enumerate(x_values):
-        for m_idx, method in enumerate(methods):
+    for xv in x_values:
+        for method in methods:
             vals = data.loc[(data[x_col] == xv) & (data[method_col] == method),
                             value_col].dropna()
             if len(vals) == 0:
                 continue
             boxes.append(vals.values)
-            positions.append(x_idx + (m_idx - len(methods) / 2 + 0.5) * width)
+            positions.append(pos_map[(xv, method)])
             colors.append(method_color(method))
 
     if boxes:
