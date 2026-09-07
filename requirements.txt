@@ -1,4 +1,0 @@
-node2vec==0.5.0
-torch==2.4.0
-scipy==1.10.1
-pandas==2.0.3
