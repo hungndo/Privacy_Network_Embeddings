@@ -868,7 +868,8 @@ SBM_ALL_NOISED_HPARAMS = dict(
     schedule_privacy=0.001, schedule_privacy_gamma=0.1,
 )
 
-OUTPUT_CSV = "results_dp_sbm_dcsbm_n500.csv"
+# [CHANGE 7] The cluster launcher sets OUTPUT_CSV to an isolated run directory.
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "results_dp_sbm_dcsbm_n500.csv")
 
 FIELDNAMES = [
     "N", "K", "dc_sigma", "normalize_weights",
