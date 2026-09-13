@@ -44,6 +44,21 @@ command without submitting or creating output. CPU-only runs require both
 `CN_GRES=none` and `CN_REQUIRE_CUDA=0`; GPU availability is otherwise checked
 on every worker before the experiment starts.
 
+For the CPU-only SFU path used by this project, `submit_all_cpu.sh` is a
+one-command alternative. It submits a compute-node job to create/update the
+virtual environment and run the tests, then four dependent arrays and four
+dependent merge checks. Its only access-node work is `mkdir` and `sbatch`:
+
+```bash
+cd /home/oward/scratch/Privacy_Network_Embeddings/complex_network
+./submit_all_cpu.sh
+```
+
+It defaults to the `gcc` and `python` modules, six CPUs, 8 GB per CPU, a
+2,000-minute time limit, and four concurrent tasks per array. Override a
+cluster-specific value before submission, for example
+`CN_PYTHON_MODULE=python/3.11 CN_MAX_PARALLEL=2 ./submit_all_cpu.sh`.
+
 The committed result CSVs and figures predate CHANGE 6. They must not be
 reported with the corrected privacy guarantee; regenerate them before updating
 the paper.
