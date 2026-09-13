@@ -2,21 +2,19 @@
 DP-SBM comparison experiment on SPARSE synthetic graphs (complex-network
 variant), n = 500.
 
-Derived from thesis/script_sparse_synthetic_graph.py, carrying the SAME five
+Derived from thesis/script_sparse_synthetic_graph.py, carrying the SAME six
 changes that complex_network/script_no_known_node_label_synthetic_graph.py
 carries, with the same [CHANGE n] numbering so the files cross-reference.
 Read that file's docstring for the full rationale.
 
   [CHANGE 1] Analytic per-example gradient wrt gamma_logits, replacing the
       vmap(grad(...)) path.  At n=500 with sample_pct=0.1 the old path
-      materialized an (L, N, K) tensor of 24,950 x 500 x 2 floats = 100 MB
-      per gamma step; the decomposition makes that ~0.4 MB.  Not the
+      materialized an (L, N, K) tensor of 12,475 x 500 x 2 floats = 50 MB
+      per gamma step; the decomposition makes that ~0.2 MB. Not the
       bottleneck at this size, but kept identical to the other drivers so
       all four share one engine.
 
-  [CHANGE 2] sigma grid is now [1.0, 2.0, 5.0, 10.0, 20.0] -- 0.5 dropped
-      from the thesis grid, 20.0 added at the private end.  epsilon spans
-      ~27 down to ~1.
+  [CHANGE 2] The smallest sigma was dropped and a private-end value added.
 
   [CHANGE 3] Per-example ELBO loss divides `rest` by M = N(N-1)/2, the
       number of UNORDERED node pairs, not by the batch size L.
@@ -28,6 +26,11 @@ Read that file's docstring for the full rationale.
   [CHANGE 5] rho is updated in closed form (rho = 1 + sum_i gamma_i), with
       no noise, no clipping, and no accountant channel.  eps_combined now
       composes TWO channels; the epsilon_rho CSV column is gone.
+
+  [CHANGE 6] Privacy-audit fixes: unique unordered batches without
+      replacement, maintained REPLACE_ONE RDP accounting, rest/M added
+      after noisy aggregation, a symmetric Beta posterior, and a
+      recalibrated sigma grid.
 
 DIFFERENT FROM THE THESIS SPARSE SCRIPT, beyond the five changes:
 
@@ -59,17 +62,10 @@ SPARSE-SPECIFIC, unchanged from the thesis script:
     graph is the same across all sigmas, so the sigma sweep is not
     confounded by resampling.
 
-  * EVERY METHOD IS FIT ON THE LARGEST CONNECTED COMPONENT ONLY.  Whole
-    graphs are essentially never connected at these densities (mean degree
-    3.4 / 2.7, well under the log(n) ~ 6.2 threshold), and the LCC covers
-    ~96% / ~92% of nodes, the remainder being almost entirely isolated
-    vertices that carry no signal for any method.  This is retained even
-    though the non-private spectral baseline that originally motivated it
-    is gone, because `edge_flip_spectral` needs it too: at large epsilon
-    p_flip ~ 0, so A_flipped ~ A, and SpectralClustering with a precomputed
-    affinity over a disconnected graph recovers COMPONENT indicators rather
-    than blocks.  Per-rep diagnostics of the FULL drawn graph are still
-    written to the CSV alongside n_fit (= lcc_size).
+  * [CHANGE 6g] Every method is fit on the full fixed public vertex set.
+    Earlier runs selected the graph-dependent largest connected component,
+    which changed n and was outside the stated edge-DP mechanism. LCC
+    diagnostics remain in the CSV to quantify fragmentation.
 
 REPRODUCIBILITY FIX vs the thesis script: it seeded reps with
 `hash((regime, rep))`.  Python randomizes str hashing per process
@@ -96,6 +92,8 @@ from sklearn.cluster import SpectralClustering
 from sklearn.metrics import normalized_mutual_info_score
 from torch.func import grad, vmap
 from torch.special import digamma, gammaln
+from dp_accounting import dp_event, privacy_accountant
+from dp_accounting.rdp import rdp_privacy_accountant
 
 
 def _mem_report():
@@ -111,25 +109,34 @@ def _mem_report():
 # DP helpers (shared)
 # ══════════════════════════════════════════════════════════════════════════
 
-def accumulate_privacy(log_moments, sigma, q, max_lambda=32):
-    for lam in range(1, max_lambda + 1):
-        log_moments[lam] += (q ** 2 * lam * (lam + 1)) / ((1.0 - q) * sigma ** 2)
-    return log_moments
+# [CHANGE 6a] Use the maintained RDP accountant for fixed-size sampling
+# without replacement under REPLACE_ONE adjacency.
+RDP_ORDERS = tuple(range(2, 129)) + (192, 256)
 
 
-def get_epsilon(log_moments, delta):
-    return min(
-        (log_moments[lam] - math.log(delta)) / lam
-        for lam in log_moments
-    )
+def compute_eps_from_updates(source_size, sample_size, sigma_beta, sigma_gamma,
+                             beta_updates, gamma_updates, target_delta):
+    """Return epsilon for gamma, beta, and their joint RDP composition."""
+    def new_accountant():
+        return rdp_privacy_accountant.RdpAccountant(
+            orders=RDP_ORDERS,
+            neighboring_relation=privacy_accountant.NeighboringRelation.REPLACE_ONE,
+        )
 
-
-def get_epsilon_combined(*log_moments_dicts, delta):
-    keys = log_moments_dicts[0].keys()
-    return min(
-        (sum(d[lam] for d in log_moments_dicts) - math.log(delta)) / lam
-        for lam in keys
-    )
+    gamma_event = dp_event.SampledWithoutReplacementDpEvent(
+        source_size, sample_size, dp_event.GaussianDpEvent(sigma_gamma))
+    beta_event = dp_event.SampledWithoutReplacementDpEvent(
+        source_size, sample_size, dp_event.GaussianDpEvent(sigma_beta))
+    acc_gamma, acc_beta, acc_joint = new_accountant(), new_accountant(), new_accountant()
+    if gamma_updates:
+        acc_gamma.compose(gamma_event, count=gamma_updates)
+        acc_joint.compose(gamma_event, count=gamma_updates)
+    if beta_updates:
+        acc_beta.compose(beta_event, count=beta_updates)
+        acc_joint.compose(beta_event, count=beta_updates)
+    return (acc_gamma.get_epsilon(target_delta),
+            acc_beta.get_epsilon(target_delta),
+            acc_joint.get_epsilon(target_delta))
 
 
 def compute_eps_target_pair(N, sigma_beta, sigma_gamma, sample_pct,
@@ -143,23 +150,12 @@ def compute_eps_target_pair(N, sigma_beta, sigma_gamma, sample_pct,
 
     Returns (eps_gamma, eps_beta, eps_combined).
     """
-    total_ordered_pairs = N * (N - 1)
-    n_samples = max(1, int(sample_pct * total_ordered_pairs))
-    q = n_samples / total_ordered_pairs
-
-    lm_gamma = {lam: 0.0 for lam in range(1, 33)}
-    for _ in range(iter_ * gamma_steps):
-        lm_gamma = accumulate_privacy(lm_gamma, sigma_gamma, q)
-
-    lm_beta = {lam: 0.0 for lam in range(1, 33)}
-    for _ in range(iter_ * beta_steps):
-        lm_beta = accumulate_privacy(lm_beta, sigma_beta, q)
-
-    eps_gamma = get_epsilon(lm_gamma, target_delta)
-    eps_beta = get_epsilon(lm_beta, target_delta)
-    eps_combined = get_epsilon_combined(lm_gamma, lm_beta, delta=target_delta)
-
-    return eps_gamma, eps_beta, eps_combined
+    # [CHANGE 6b] One record is one unordered dyad, matching edge adjacency.
+    total_pairs = N * (N - 1) // 2
+    n_samples = min(total_pairs, max(1, int(sample_pct * total_pairs)))
+    return compute_eps_from_updates(
+        total_pairs, n_samples, sigma_beta, sigma_gamma,
+        iter_ * beta_steps, iter_ * gamma_steps, target_delta)
 
 
 def clip_per_example(grads_list, C, min_norm=1):
@@ -370,10 +366,16 @@ def labels_from_spectral(A_flipped, num_blocks, seed=0):
 # Method: fully-variational DP-SGD SBM (noise on gamma AND beta; NOT rho)
 # ══════════════════════════════════════════════════════════════════════════
 
+def symmetric_beta_parameters(log_alpha1, log_alpha2):
+    """[CHANGE 6c] Map unconstrained matrices to one symmetric SBM posterior."""
+    log_alpha1 = 0.5 * (log_alpha1 + log_alpha1.T)
+    log_alpha2 = 0.5 * (log_alpha2 + log_alpha2.T)
+    return F.softplus(log_alpha1), F.softplus(log_alpha2)
+
+
 def elbo_L1(A, gamma_logits, log_alpha1, log_alpha2, i_idx, j_idx, temperature):
     gamma = F.softmax(gamma_logits / temperature, dim=-1)
-    alpha1 = F.softplus(log_alpha1)
-    alpha2 = F.softplus(log_alpha2)
+    alpha1, alpha2 = symmetric_beta_parameters(log_alpha1, log_alpha2)
     alpha_sum = alpha1 + alpha2
     E_log_b = digamma(alpha1) - digamma(alpha_sum)
     E_log_1m_b = digamma(alpha2) - digamma(alpha_sum)
@@ -392,8 +394,7 @@ def elbo_rest(gamma_logits, log_alpha1, log_alpha2, rho, temperature):
     N, K = gamma_logits.shape
     device = gamma_logits.device
     gamma = F.softmax(gamma_logits / temperature, dim=-1)
-    alpha1 = F.softplus(log_alpha1)
-    alpha2 = F.softplus(log_alpha2)
+    alpha1, alpha2 = symmetric_beta_parameters(log_alpha1, log_alpha2)
     alpha_sum = alpha1 + alpha2
     E_log_b = digamma(alpha1) - digamma(alpha_sum)
     E_log_1m_b = digamma(alpha2) - digamma(alpha_sum)
@@ -410,9 +411,11 @@ def elbo_rest(gamma_logits, log_alpha1, log_alpha2, rho, temperature):
     prior_alpha1[~diag] = 1.0
     prior_alpha2[~diag] = 3.0
     prior_sum = prior_alpha1 + prior_alpha2
-    L4 = ((prior_alpha1 - 1) * E_log_b
-          + (prior_alpha2 - 1) * E_log_1m_b
-          + gammaln(prior_sum) - gammaln(prior_alpha1) - gammaln(prior_alpha2)).sum()
+    upper = torch.triu(torch.ones(K, K, dtype=torch.bool, device=device))
+    L4_terms = ((prior_alpha1 - 1) * E_log_b
+                + (prior_alpha2 - 1) * E_log_1m_b
+                + gammaln(prior_sum) - gammaln(prior_alpha1) - gammaln(prior_alpha2))
+    L4 = L4_terms[upper].sum()
 
     L5 = -(gamma * torch.log(gamma + 1e-10)).sum()
 
@@ -421,7 +424,8 @@ def elbo_rest(gamma_logits, log_alpha1, log_alpha2, rho, temperature):
            + ((rho - 1) * digamma(rho)).sum())
 
     log_B = gammaln(alpha1) + gammaln(alpha2) - gammaln(alpha_sum)
-    L7 = (log_B - (alpha1 - 1) * E_log_b - (alpha2 - 1) * E_log_1m_b).sum()
+    L7_terms = log_B - (alpha1 - 1) * E_log_b - (alpha2 - 1) * E_log_1m_b
+    L7 = L7_terms[upper].sum()
 
     return L2 + L4 + L5 + L6 + L7
 
@@ -455,8 +459,8 @@ def elbo_sampled(A, gamma_logits, log_alpha1, log_alpha2, rho, M_pairs,
     """Monitoring only.  Scaled to estimate the FULL ELBO: the sampled L1 is
     inflated by M_pairs/n_samples, then rest is added once."""
     N = gamma_logits.shape[0]
-    total_ordered_pairs = N * (N - 1)
-    n_samples = max(1, int(sample_pct * total_ordered_pairs))
+    total_pairs = N * (N - 1) // 2
+    n_samples = min(total_pairs, max(1, int(sample_pct * total_pairs)))
     i_idx, j_idx, L = sample_pairs(N, n_samples, gamma_logits.device)
     L1 = elbo_L1(A, gamma_logits, log_alpha1, log_alpha2, i_idx, j_idx, temperature)
     rest = elbo_rest(gamma_logits, log_alpha1, log_alpha2, rho, temperature)
@@ -465,13 +469,13 @@ def elbo_sampled(A, gamma_logits, log_alpha1, log_alpha2, rho, M_pairs,
 
 def _loss_single(log_alpha1, log_alpha2, gamma_logits, rho, A, i, j, M, temperature):
     """
-    [CHANGE 3] `rest / M` with M = N(N-1)/2, not `rest / L`.
-    [CHANGE 5] rho is an input, not a differentiated parameter.
+    [CHANGE 6d] The clipped per-example contribution contains h_ij only.
+    The data-independent rest/M gradient is added after noise, matching
+    Equation (15) in the paper.
     """
     l1 = elbo_L1(A, gamma_logits, log_alpha1, log_alpha2,
                  i.unsqueeze(0), j.unsqueeze(0), temperature)
-    rest = elbo_rest(gamma_logits, log_alpha1, log_alpha2, rho, temperature)
-    return -(l1 + rest / M)
+    return -l1
 
 
 def build_per_example_grad_fn_alpha():
@@ -483,49 +487,58 @@ def build_per_example_grad_fn_alpha():
 
 
 def sample_pairs(N, n_samples, device):
-    """Uniform ORDERED pairs (i, j) with i != j, drawn with replacement."""
-    idx = torch.randint(0, N, (n_samples * 2, 2), device=device)
-    idx = idx[idx[:, 0] != idx[:, 1]][:n_samples]
-    return idx[:, 0], idx[:, 1], idx.shape[0]
+    """[CHANGE 6b] Uniform unique UNORDERED pairs, sampled without replacement."""
+    total_pairs = N * (N - 1) // 2
+    n_samples = min(total_pairs, max(1, n_samples))
+    index_dtype = torch.int32 if total_pairs <= torch.iinfo(torch.int32).max else torch.int64
+    flat = torch.randperm(total_pairs, device=device, dtype=index_dtype)[:n_samples]
+    flat = flat.to(torch.int64)
+    a = 2 * N - 1
+    i_idx = torch.floor(
+        (a - torch.sqrt((a * a - 8 * flat.to(torch.float64)).clamp_min(0))) / 2
+    ).to(torch.int64)
+    start = i_idx * (2 * N - i_idx - 1) // 2
+    i_idx = torch.where(start > flat, i_idx - 1, i_idx)
+    start = i_idx * (2 * N - i_idx - 1) // 2
+    next_start = (i_idx + 1) * (2 * N - i_idx - 2) // 2
+    i_idx = torch.where(next_start <= flat, i_idx + 1, i_idx)
+    start = i_idx * (2 * N - i_idx - 1) // 2
+    j_idx = i_idx + 1 + flat - start
+    return i_idx, j_idx, flat.numel()
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # [CHANGE 1] Analytic per-example gradient wrt gamma_logits.
 #
 # vmap(grad(...)) over gamma_logits materializes an (L, N, K) tensor.  At
-# polblogs' N=1222 with sample_pct=0.1 that is
+# N=500 with sample_pct=0.1 that is
 #
-#     L = 149,206  ->  149,206 x 1222 x 2 x 4 B  =  1.46 GB  per gamma step
+#     L = 12,475  ->  12,475 x 500 x 2 x 4 B  =  50 MB per gamma step
 #
 # allocated and freed 60 times per fit (iter * gamma_steps), on top of the
 # autograd graph the thesis script's detach comment reports leaking at ~13 GB
 # per rep.
 #
-# But the per-example gradient has exploitable structure.  Writing the loss
-# for example e = (i, j) as  -(l1_e + rest/M):
-#
-#     g_e = D + S_e ,     D   = -grad(rest)/M      shared by ALL examples
-#                         S_e = -grad(l1_e)        nonzero in rows i, j only
-#
-# D is the same dense (N, K) tensor for every example in the step, so it is
-# computed once; S_e is two K-vectors.  Both the per-example clip norms and
-# the clipped sum follow in closed form:
-#
-#     ||g_e||^2      = ||D||^2 + 2<D, S_e> + ||S_e||^2
-#     sum_e s_e g_e  = (sum_e s_e) D + scatter_add(s_e S_e)
-#
-# giving O(L*K + N*K) memory instead of O(L*N*K) -- ~1.2 MB here rather than
-# 1.46 GB -- with identical values.
+# The gradient of -l1_e is nonzero only in rows i and j, so clipping and
+# aggregation need O(L*K + N*K), not O(L*N*K). The data-independent
+# gradient of -rest/M is computed once and added after Gaussian noise.
 # ──────────────────────────────────────────────────────────────────────────
 
 def shared_gamma_grad(gamma_logits, log_alpha1, log_alpha2, rho, temperature, M_pairs):
-    """D = -grad(rest)/M -- the part of the per-example gamma gradient that
-    every example in the step shares.  One autograd pass per step."""
+    """[CHANGE 6d] The data-independent -grad(rest)/M for one gamma step."""
     gl = gamma_logits.detach().requires_grad_(True)
     rest = elbo_rest(gl, log_alpha1.detach(), log_alpha2.detach(),
                      rho.detach(), temperature)
     (d_rest,) = torch.autograd.grad(rest, gl)
     return -d_rest / M_pairs
+
+
+def shared_alpha_grad(gamma_logits, log_alpha1, log_alpha2, rho, temperature, M_pairs):
+    """[CHANGE 6d] The data-independent -grad(rest)/M for one alpha step."""
+    a1 = log_alpha1.detach().requires_grad_(True)
+    a2 = log_alpha2.detach().requires_grad_(True)
+    rest = elbo_rest(gamma_logits.detach(), a1, a2, rho.detach(), temperature)
+    return tuple(g.detach() for g in torch.autograd.grad(-rest / M_pairs, (a1, a2)))
 
 
 def example_gamma_grad_rows(A, gamma_logits, log_alpha1, log_alpha2,
@@ -542,8 +555,7 @@ def example_gamma_grad_rows(A, gamma_logits, log_alpha1, log_alpha2,
     The leading minus is the loss's.
     """
     gamma = F.softmax(gamma_logits / temperature, dim=-1)
-    alpha1 = F.softplus(log_alpha1)
-    alpha2 = F.softplus(log_alpha2)
+    alpha1, alpha2 = symmetric_beta_parameters(log_alpha1, log_alpha2)
     alpha_sum = alpha1 + alpha2
     E_log_b = digamma(alpha1) - digamma(alpha_sum)
     E_log_1m_b = digamma(alpha2) - digamma(alpha_sum)
@@ -562,22 +574,17 @@ def example_gamma_grad_rows(A, gamma_logits, log_alpha1, log_alpha2,
     return s_i, s_j
 
 
-def clip_decomposed(D, s_i, s_j, i_idx, j_idx, C, min_norm=1.0):
+def clip_sparse_rows(s_i, s_j, i_idx, j_idx, N, C, min_norm=1.0):
     """
-    Per-example clip and sum for g_e = D + S_e, without ever forming g_e.
-    Numerically equivalent to clip_per_example([g_gamma], C) on the dense
-    (L, N, K) tensor; `min_norm=1` matches its clamp.
+    Per-example clip and sum for a gradient supported only on rows i and j.
+    Numerically equivalent to clipping the dense (L, N, K) tensor.
 
     Returns (clipped_sum (N,K), post_clip_norms (L,)).
     """
-    dnorm2 = (D * D).sum()
-    cross = (D[i_idx] * s_i).sum(-1) + (D[j_idx] * s_j).sum(-1)
     snorm2 = (s_i * s_i).sum(-1) + (s_j * s_j).sum(-1)
-    # clamp_min guards the catastrophic-cancellation case ||D+S|| ~ 0
-    norms = torch.sqrt(torch.clamp(dnorm2 + 2.0 * cross + snorm2, min=0.0))
-
+    norms = torch.sqrt(torch.clamp(snorm2, min=0.0))
     scale = (C / (norms + 1e-8)).clamp(max=min_norm)
-    out = D * scale.sum()
+    out = torch.zeros((N, s_i.shape[1]), dtype=s_i.dtype, device=s_i.device)
     out.index_add_(0, i_idx, s_i * scale.unsqueeze(1))
     out.index_add_(0, j_idx, s_j * scale.unsqueeze(1))
     return out, norms * scale
@@ -605,9 +612,8 @@ def binary_sbm_estimate_fully_variational(
     Returns (gamma_posterior, rho_posterior, beta_posterior_mean,
              epochs_gamma, epochs_beta, epochs_total).
 
-    epochs_* are computed from the ACTUAL realized batch size L at every step
-    (summed over all iters * inner steps, divided by the ordered pair count)
-    -- L can be slightly under n_samples after the i!=j dedup.
+    epochs_* are computed from the batch size L at every step, divided by
+    the number of unordered dyads.
 
     [CHANGE 5] sigma_rho/C_rho are gone from the signature: rho is not a
     noisy channel any more.  epochs_beta now covers alpha only, since rho no
@@ -645,14 +651,11 @@ def binary_sbm_estimate_fully_variational(
         {"params": [log_alpha1, log_alpha2], "lr": lr_beta, "initial_lr": lr_beta},
     ])
 
-    # Two distinct pair counts, deliberately named apart -- see [CHANGE 3].
-    total_ordered_pairs = N * (N - 1)          # what the sampler draws from; sets q
-    M_pairs = N * (N - 1) / 2.0                # unordered pairs; the ELBO's L1 term count
-    n_samples = max(1, int(sample_pct * total_ordered_pairs))
-    q = n_samples / total_ordered_pairs
-
-    log_moments_beta = {lam: 0.0 for lam in range(1, 33)}
-    log_moments_gamma = {lam: 0.0 for lam in range(1, 33)}
+    # [CHANGE 6b] The sampler and accountant share the unordered dyad universe.
+    M_pairs = N * (N - 1) // 2
+    n_samples = min(M_pairs, max(1, int(sample_pct * M_pairs)))
+    gamma_updates = 0
+    beta_updates = 0
 
     total_L_gamma = 0
     total_L_beta = 0
@@ -678,11 +681,10 @@ def binary_sbm_estimate_fully_variational(
             i_idx, j_idx, L = sample_pairs(N, n_samples, device)
             total_L_gamma += L
 
-            # D is batch-independent: one autograd pass for the whole step.
-            D = shared_gamma_grad(gamma_logits, log_alpha1, log_alpha2,
-                                  rho, temperature, M_pairs)
+            rest_grad = shared_gamma_grad(gamma_logits, log_alpha1, log_alpha2,
+                                          rho, temperature, M_pairs)
 
-            clipped_sum = torch.zeros_like(D)
+            clipped_sum = torch.zeros_like(rest_grad)
             norm_total, norm_count = 0.0, 0
             for s in range(0, L, grad_chunk):
                 e = min(L, s + grad_chunk)
@@ -690,18 +692,21 @@ def binary_sbm_estimate_fully_variational(
                 s_i, s_j = example_gamma_grad_rows(
                     A, gamma_logits.detach(), log_alpha1.detach(),
                     log_alpha2.detach(), ii, jj, temperature)
-                part, part_norms = clip_decomposed(D, s_i, s_j, ii, jj, C_gamma, min_norm=1)
+                part, part_norms = clip_sparse_rows(
+                    s_i, s_j, ii, jj, N, C_gamma, min_norm=1)
                 clipped_sum += part
                 norm_total += part_norms.sum().item()
                 norm_count += part_norms.numel()
 
-            gamma_grad = (clipped_sum + torch.randn_like(clipped_sum) * sigma_gamma * 2 * C_gamma) / L
+            gamma_grad = (
+                clipped_sum + torch.randn_like(clipped_sum) * sigma_gamma * 2 * C_gamma
+            ) / L + rest_grad
             avg_grad_norm_gamma = norm_total / max(norm_count, 1)
 
             optimizer_gamma.zero_grad()
             gamma_logits.grad = gamma_grad
-            log_moments_gamma = accumulate_privacy(log_moments_gamma, sigma_gamma, q)
             optimizer_gamma.step()
+            gamma_updates += 1
 
         # [CHANGE 5] Closed-form rho, once the gamma channel has moved.
         # Post-processing of DP output -- no noise, no accountant entry.
@@ -717,6 +722,8 @@ def binary_sbm_estimate_fully_variational(
 
             i_idx, j_idx, L = sample_pairs(N, n_samples, device)
             total_L_beta += L
+            rest_grads = shared_alpha_grad(
+                gamma_logits, log_alpha1, log_alpha2, rho, 1.0, M_pairs)
 
             g_a1_sum = torch.zeros_like(log_alpha1)
             g_a2_sum = torch.zeros_like(log_alpha2)
@@ -741,25 +748,24 @@ def binary_sbm_estimate_fully_variational(
                 norm_count += norms.numel()
 
             dp_grads = [
-                (s_ + torch.randn_like(s_) * sigma * 2 * C) / L
-                for s_ in (g_a1_sum, g_a2_sum)
+                (s_ + torch.randn_like(s_) * sigma * 2 * C) / L + rest_grad
+                for s_, rest_grad in zip((g_a1_sum, g_a2_sum), rest_grads)
             ]
             avg_grad_norm_beta = norm_total / max(norm_count, 1)
 
             optimizer_beta.zero_grad()
             for p, g in zip(dp_params_beta, dp_grads):
                 p.grad = g
-            log_moments_beta = accumulate_privacy(log_moments_beta, sigma, q)
             optimizer_beta.step()
+            beta_updates += 1
 
         if verbose:
             with torch.no_grad():
                 loss = elbo_sampled(A, gamma_logits, log_alpha1, log_alpha2, rho,
                                     M_pairs, sample_pct=sample_pct, temperature=1.0)
-            eps_beta = get_epsilon(log_moments_beta, target_delta)
-            eps_gamma = get_epsilon(log_moments_gamma, target_delta)
-            eps_combined = get_epsilon_combined(log_moments_gamma, log_moments_beta,
-                                                delta=target_delta)
+            eps_gamma, eps_beta, eps_combined = compute_eps_from_updates(
+                M_pairs, n_samples, sigma, sigma_gamma,
+                beta_updates, gamma_updates, target_delta)
             print(f"  step {step} | elbo: {loss.item():.4f} "
                   f"| grad norm (gamma/beta): {avg_grad_norm_gamma:.4f}/{avg_grad_norm_beta:.4f} "
                   f"| rho: {rho.detach().cpu().numpy().round(2)} "
@@ -768,12 +774,14 @@ def binary_sbm_estimate_fully_variational(
 
     gamma_posterior = F.softmax(gamma_logits / T_end, dim=-1).detach()
     rho_posterior = rho.detach()
-    alpha1_posterior = F.softplus(log_alpha1).detach()
-    alpha2_posterior = F.softplus(log_alpha2).detach()
+    alpha1_posterior, alpha2_posterior = symmetric_beta_parameters(
+        log_alpha1, log_alpha2)
+    alpha1_posterior = alpha1_posterior.detach()
+    alpha2_posterior = alpha2_posterior.detach()
     beta_posterior_mean = alpha1_posterior / (alpha1_posterior + alpha2_posterior)
 
-    epochs_gamma = total_L_gamma / total_ordered_pairs
-    epochs_beta = total_L_beta / total_ordered_pairs
+    epochs_gamma = total_L_gamma / M_pairs
+    epochs_beta = total_L_beta / M_pairs
     epochs_total = epochs_gamma + epochs_beta
 
     return gamma_posterior, rho_posterior, beta_posterior_mean, epochs_gamma, epochs_beta, epochs_total
@@ -793,9 +801,9 @@ REGIMES = {
 }
 REGIME_ORDER = ["relatively_sparse", "sparse"]        # fixed order, for stable sharding
 
-# [CHANGE 2] 0.5 dropped, 20.0 added.  Budgets are roughly
-# epsilon = 27, 12, 4.1, 2.0, 1.0.
-SIGMAS = [1.0, 2.0, 5.0, 10.0, 20.0]
+# [CHANGE 6e] Recalibrated for the valid without-replacement accountant.
+# Budgets are roughly epsilon = 27, 13, 4, 2, 1.
+SIGMAS = [2.0, 3.0, 7.0, 12.0, 24.0]
 
 N_REPS = 20
 N_VEM_RESTARTS = 10   # free w.r.t. privacy: every restart re-processes the
@@ -823,7 +831,8 @@ SBM_ALL_NOISED_HPARAMS = dict(
     schedule_privacy=0.001, schedule_privacy_gamma=0.1,
 )
 
-OUTPUT_CSV = "results_dp_sbm_sparse_n500.csv"
+# [CHANGE 7] The cluster launcher sets OUTPUT_CSV to an isolated run directory.
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "results_dp_sbm_sparse_n500.csv")
 
 FIELDNAMES = [
     "regime", "N", "p", "q",       # `regime` is the sweep axis (replaces N)
@@ -832,10 +841,9 @@ FIELDNAMES = [
                                        # ([CHANGE 5] epsilon_rho gone)
     "epochs", "epochs_gamma", "epochs_beta",
     "delta",
-    # ── diagnostics of THIS rep's FULL drawn graph, before LCC extraction ──
-    # All methods are fit on the LCC, so n_fit (= lcc_size) is the node count
-    # actually modelled; N stays the nominal draw size and the rest describe
-    # how fragmented the draw was.
+    # ── diagnostics of THIS rep's full drawn graph ──
+    # All methods are now fit on the full fixed vertex set; LCC fields remain
+    # diagnostics of graph fragmentation.
     "n_fit",
     "mean_degree", "lcc_size", "lcc_frac", "n_components", "n_isolated",
     "beta_true_00", "beta_true_01", "beta_true_11",
@@ -856,11 +864,8 @@ def regime_params(regime, n=GRAPH_SIZE):
 
 def make_graph(N, p, q, seed):
     """
-    Draw a planted-partition SBM graph, AS DRAWN -- no connectivity check and
-    no rejection sampling.  At these densities whole graphs are essentially
-    never connected, so requiring connectivity would either loop forever or
-    force a different sparsity regime.  The caller passes the draw through
-    extract_lcc() and fits every method on the largest connected component.
+    Draw a planted-partition SBM graph as drawn, with no connectivity check,
+    rejection sampling, or graph-dependent vertex filtering.
     """
     block_sizes = [N // 2, N - N // 2]
     probs = np.array([[p, q], [q, p]])
@@ -870,21 +875,10 @@ def make_graph(N, p, q, seed):
     return A, labels
 
 
-def extract_lcc(A_np, labels):
-    """
-    Restrict a drawn graph to its largest connected component, preserving the
-    original relative node order.  Returns (A_lcc, labels_lcc).
-    """
-    _n_comp, comp_labels = connected_components(csr_matrix(A_np), directed=False)
-    lcc_id = np.bincount(comp_labels).argmax()
-    keep = np.flatnonzero(comp_labels == lcc_id)
-    return A_np[np.ix_(keep, keep)], labels[keep]
-
-
 def graph_stats(A_np):
     """
-    Connectivity diagnostics for one FULL drawn graph, before the LCC is
-    extracted -- for logging only.  Nothing branches on these.
+    Connectivity diagnostics for one full drawn graph, for logging only.
+    Nothing branches on these.
     Returns (mean_degree, lcc_size, lcc_frac, n_components, n_isolated).
     """
     n = A_np.shape[0]
@@ -955,11 +949,8 @@ def run(shard_id=0, num_shards=1):
         print(f"Regime '{regime}': p={p:.6f}  q={q_edge:.6f}  "
               f"expected degree ~ {exp_deg:.2f}", flush=True)
 
-    # epsilon depends on (N, sigma), and N is fixed -- one table for the run.
-    # Computed at the NOMINAL N even though fits run on the (smaller) LCC: the
-    # accountant sees N only through q = int(sample_pct*N(N-1))/(N(N-1)) =
-    # sample_pct up to flooring, so the LCC size moves epsilon by <1e-6, while
-    # a per-rep epsilon would make the column unusable as a grouping key.
+    # N is fixed and every method uses the full public vertex set, so one
+    # accountant table applies to all replicates.
     eps_table = {}
     for sigma in SIGMAS:
         eps_table[sigma] = compute_eps_target_pair(
@@ -989,11 +980,9 @@ def run(shard_id=0, num_shards=1):
             # identical graph at every sigma.
             seed = rep_seed(regime, rep)
             A_full, labels_full = make_graph(N, p, q_edge, seed)
-            # Diagnostics describe the FULL draw...
             mean_degree, lcc_size, lcc_frac, n_comp, n_iso = graph_stats(A_full)
-            # ...but every method below is fit, and every metric scored, on
-            # the largest connected component alone.
-            A_np, true_labels = extract_lcc(A_full, labels_full)
+            # [CHANGE 6g] Keep the public vertex set fixed for edge privacy.
+            A_np, true_labels = A_full, labels_full
             n_fit = A_np.shape[0]
             A_t = torch.tensor(A_np, dtype=torch.float32, device=DEVICE)
             gstats = dict(n_fit=n_fit, mean_degree=mean_degree,
